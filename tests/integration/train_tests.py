@@ -149,6 +149,39 @@ class TrainTests(unittest.TestCase):
       rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.mistral-v1')}",
   ]
 
+  # Qwen3.5 is a hybrid decoder: `inhomogeneous_layer_cycle_interval` is 4, so three
+  # gated-delta-net layers are followed by one full-attention layer, both on top of a
+  # fully-MoE block with a shared expert. Four layers is one whole cycle, so every
+  # sublayer runs. head_dim has to stay at 256 because `mrope_section` sums to
+  # head_dim * partial_rotary_factor / 2.
+  _qwen3_5_overrides = [
+      "model_name=qwen3.5-35b-a3b",
+      "override_model_config=True",
+      "base_num_decoder_layers=4",
+      "base_emb_dim=256",
+      "base_mlp_dim=256",
+      "base_moe_mlp_dim=256",
+      "base_num_query_heads=8",
+      "base_num_kv_heads=8",
+      "head_dim=256",
+      "num_experts=8",
+      "num_experts_per_tok=2",
+      "gdn_num_key_heads=4",
+      "gdn_num_value_heads=8",
+      "gdn_key_head_dim=64",
+      "gdn_value_head_dim=64",
+      "vocab_size=2048",
+      "max_target_length=256",
+      # RoutedMoE.dense_matmul is not onboarded to explicit sharding yet, so exercise the
+      # sparse_matmul path.
+      "sparse_matmul=True",
+      "megablox=True",
+      # The Qwen3.5 model configs default to a HuggingFace tokenizer that is not
+      # vendored in the repo; use the checked-in tiktoken asset instead.
+      "tokenizer_type=tiktoken",
+      rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
+  ]
+
   CONFIGS = {
       "base": [  # short test for train.py with TFDS c4
           None,
@@ -701,8 +734,8 @@ class TrainTests(unittest.TestCase):
     ]
     train_main(zero1_ga)
 
-  def _qwen3_losses(self, run_name, extra_args):
-    """Trains a tiny Qwen3 model for a few steps and returns its per-step losses."""
+  def _losses(self, run_name, model_overrides, extra_args):
+    """Trains a tiny model for a few steps and returns its per-step losses."""
     with tempfile.TemporaryDirectory() as tmp_dir:
       metrics_file = os.path.join(tmp_dir, "metrics.txt")
       train_main(
@@ -718,11 +751,15 @@ class TrainTests(unittest.TestCase):
               "enable_checkpointing=False",
               "enable_goodput_recording=False",
           ]
-          + self._qwen3_overrides
+          + list(model_overrides)
           + list(extra_args)
       )
       with open(metrics_file, "rt", encoding="utf8") as f:
         return [json.loads(line)["learning/loss"] for line in f if line.strip()]
+
+  def _qwen3_losses(self, run_name, extra_args):
+    """Trains a tiny Qwen3 model for a few steps and returns its per-step losses."""
+    return self._losses(run_name, self._qwen3_overrides, extra_args)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
@@ -788,26 +825,7 @@ class TrainTests(unittest.TestCase):
 
   def _mistral_losses(self, run_name, extra_args):
     """Trains a tiny Mistral/Mixtral model for a few steps and returns its per-step losses."""
-    with tempfile.TemporaryDirectory() as tmp_dir:
-      metrics_file = os.path.join(tmp_dir, "metrics.txt")
-      train_main(
-          [
-              None,
-              get_test_config_path(),
-              f"base_output_directory={self._base_output_directory}",
-              f"dataset_path={self.dataset_path}",
-              f"run_name={run_name}",
-              f"metrics_file={metrics_file}",
-              "dataset_type=synthetic",
-              "steps=3",
-              "enable_checkpointing=False",
-              "enable_goodput_recording=False",
-          ]
-          + self._mistral_overrides
-          + list(extra_args)
-      )
-      with open(metrics_file, "rt", encoding="utf8") as f:
-        return [json.loads(line)["learning/loss"] for line in f if line.strip()]
+    return self._losses(run_name, self._mistral_overrides, extra_args)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
@@ -874,6 +892,76 @@ class TrainTests(unittest.TestCase):
         self.assertTrue(baseline, "baseline run produced no metrics")
         # ZeRO-1 reassociates the gradient all-reduce, so allow a little float slack.
         np.testing.assert_allclose(sharded, baseline, rtol=1e-4, atol=0.0)
+
+  @pytest.mark.integration_test
+  @pytest.mark.tpu_only
+  def test_tpu_qwen3_5_explicit_sharding_matches_auto(self):
+    """Explicit sharding only changes how layouts are expressed, so the losses must not move.
+
+    Both parallelisms are run because they stress different halves of the hybrid layer:
+    expert parallelism shards the MoE dispatch, while tensor parallelism shards the
+    gated-delta-net head axis, which is the one the layer has to carry by hand across
+    its reshapes, its head repeat and the `jax.shard_map` boundary.
+    """
+    parallelism = {
+        "expert": ["ici_fsdp_parallelism=1", "ici_expert_parallelism=-1"],
+        # The gated-delta-net weights stay replicated under tensor parallelism, which is
+        # a large fraction of a model this small, so relax the unsharded-parameter check.
+        "tensor": ["ici_fsdp_parallelism=1", "ici_tensor_parallelism=-1", "sharding_tolerance=0.5"],
+    }
+    for axis, args in parallelism.items():
+      with self.subTest(parallelism=axis):
+        auto_losses = self._losses(f"qwen3_5_{axis}_auto", self._qwen3_5_overrides, args + ["shard_mode=auto"])
+        explicit_losses = self._losses(
+            f"qwen3_5_{axis}_explicit", self._qwen3_5_overrides, args + ["shard_mode=explicit"]
+        )
+        print(f"[qwen3.5 {axis}] auto losses: {auto_losses}", flush=True)
+        print(f"[qwen3.5 {axis}] explicit losses: {explicit_losses}", flush=True)
+        self.assertTrue(auto_losses, "auto run produced no metrics")
+        # `activation_batch` carries the expert axis, so pinning it reassociates the
+        # backward reductions rather than leaving the layout untouched: the forward pass
+        # is bit-for-bit and the drift only appears once gradients flow. Over 20 steps it
+        # stays bounded below 3e-5 relative and changes sign, i.e. it is float noise
+        # rather than the two runs pulling apart.
+        np.testing.assert_allclose(explicit_losses, auto_losses, rtol=1e-4, atol=0.0)
+
+  @pytest.mark.integration_test
+  @pytest.mark.tpu_only
+  # TODO(b/517509898): Skip ZeRo-1 compiler Segfault on TPU7x SparseCore platforms
+  @pytest.mark.skip_on_tpu7x
+  def test_tpu_qwen3_5_zero1_gradient_accumulation(self):
+    """ZeRO-1 only shards the optimizer state, so it must not change the loss trajectory.
+
+    Under explicit sharding this routes the accumulated gradients through the
+    `reduced`/`unreduced` PartitionSpec labels applied in
+    `maxtext.utils.gradient_accumulation`, and casts the parameters to bf16 before the
+    accumulation scan so the all-gather happens once in low precision rather than once
+    per microbatch.
+    """
+    zero1_ga = [
+        "remat_policy=minimal",
+        "per_device_batch_size=2",
+        "ici_data_parallelism=-1",
+        "dcn_data_parallelism=1",
+        "ici_fsdp_parallelism=1",
+        "dcn_fsdp_parallelism=1",
+        "gradient_accumulation_steps=8",
+    ]
+    baseline = self._losses(
+        "qwen3_5_ga",
+        self._qwen3_5_overrides,
+        zero1_ga + ["shard_mode=auto", "shard_optimizer_over_data=False"],
+    )
+    sharded = self._losses(
+        "qwen3_5_ga_zero1",
+        self._qwen3_5_overrides,
+        zero1_ga + ["shard_mode=explicit", "shard_optimizer_over_data=True"],
+    )
+    print(f"[qwen3.5] auto + GA losses: {baseline}", flush=True)
+    print(f"[qwen3.5] explicit + ZeRO-1 + GA losses: {sharded}", flush=True)
+    self.assertTrue(baseline, "baseline run produced no metrics")
+    # ZeRO-1 reassociates the gradient all-reduce, so allow a little float slack.
+    np.testing.assert_allclose(sharded, baseline, rtol=1e-4, atol=0.0)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only

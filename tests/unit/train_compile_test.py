@@ -32,6 +32,7 @@ from tempfile import gettempdir, NamedTemporaryFile
 
 from maxtext.configs import pyconfig
 from maxtext.trainers.pre_train.train_compile import main as train_compile_main
+from maxtext.utils.globals import MAXTEXT_ASSETS_ROOT
 from tests.utils.test_helpers import get_test_config_path
 
 # Enable JAX compilation cache for testing to speed up AOT compilation
@@ -1136,6 +1137,79 @@ class TrainCompile(parameterized.TestCase):
             "megablox=True",
             "attention=flash",
             "use_tokamax_splash=True",
+        )
+    )
+
+  def test_qwen3_5_explicit_sharding(self):
+    """AOT test for Qwen3.5 at full size under explicit sharding.
+
+    This is the large-scale check for the hybrid decoder: three gated-delta-net layers
+    and one full-attention layer per cycle, on top of a fully-MoE block with a shared
+    expert. Explicit sharding type-checks every operation's layout instead of letting
+    GSPMD infer one, so a missing `out_sharding` fails the trace here rather than
+    silently costing a collective at a scale we cannot reach in a test. The mesh is
+    FSDP 32 x expert 8, both of which have to divide the v5p-512 physical mesh.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_5_explicit_sharding.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-512",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3.5-397b-a17b",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "ici_fsdp_parallelism=32",
+            "ici_expert_parallelism=8",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+            # Qwen3.5 defaults to a HuggingFace tokenizer that is not vendored.
+            "tokenizer_type=tiktoken",
+            f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
+        )
+    )
+
+  def test_qwen3_5_explicit_sharding_zero1(self):
+    """AOT test for Qwen3.5 under explicit sharding with ZeRO-1 and gradient accumulation.
+
+    ZeRO-1 shards the optimizer moments over "data", so the parameters have to be
+    all-gathered in bf16 once before the accumulation scan rather than once per
+    microbatch; that reshard only type-checks if the decoder pins its activation
+    layouts. Four layers is one full `inhomogeneous_layer_cycle_interval`, which is
+    what keeps the model small enough to hold data-parallel replicas of the
+    parameters while still covering both attention variants.
+    """
+    compiled_trainstep_file = os.path.join(gettempdir(), "test_qwen3_5_explicit_sharding_zero1.pickle")
+    train_compile_main(
+        (
+            "",
+            get_test_config_path(),
+            f"compiled_trainstep_file={compiled_trainstep_file}",
+            "compile_topology=v5p-256",
+            "compile_topology_num_slices=1",
+            "model_name=qwen3.5-35b-a3b",
+            "override_model_config=True",
+            "base_num_decoder_layers=4",
+            "per_device_batch_size=1.0",
+            "max_target_length=1024",
+            "sparse_matmul=True",
+            "megablox=True",
+            "attention=flash",
+            "use_tokamax_splash=True",
+            "shard_mode=explicit",
+            # ZeRO-1 needs a "data" axis to shard the moments over, and MaxTextConfig
+            # rejects combining it with FSDP.
+            "ici_data_parallelism=-1",
+            "ici_fsdp_parallelism=1",
+            "gradient_accumulation_steps=4",
+            "shard_optimizer_over_data=True",
+            "tokenizer_type=tiktoken",
+            f"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
         )
     )
 

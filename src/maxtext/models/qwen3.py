@@ -40,6 +40,7 @@ from maxtext.utils.sharding import (
     get_logical_axis_rules,
     logical_to_mesh_axes,
     maybe_shard_with_logical,
+    maybe_shard_with_name,
     remove_incompatible_mesh_axes_from_partition_spec,
 )
 from maxtext.layers import attentions
@@ -549,6 +550,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("embed_attn", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
     self.in_proj_ba = DenseGeneral(
@@ -558,6 +560,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("embed_attn", "gdn_head"),
         matmul_precision=cfg.matmul_precision,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 
@@ -588,6 +591,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
     self.out_proj = DenseGeneral(
@@ -597,7 +601,45 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         weight_dtype=cfg.weight_dtype,
         kernel_axes=("gdn_head", "embed_attn"),
         matmul_precision=cfg.matmul_precision,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
+    )
+
+  def _explicit_activation_shardings(self, batch: int):
+    """Physical layouts for the GatedDeltaNet activations under explicit sharding.
+
+    Explicit sharding cannot infer a layout across the reshapes, the head repeat
+    or the shard_map boundary in `__call__`, so every intermediate is pinned to
+    the same logical axes the auto path already asks GSPMD for. All three are
+    `None` under `ShardMode.AUTO`, where the callees drop the argument and GSPMD
+    keeps inferring exactly what it inferred before.
+
+    Returns:
+      `(flat, head, state)` shardings for `(B, S, H*D)`, `(B, S, H, D)` and
+      `(B, H, D_k, D_v)` shaped activations respectively.
+    """
+    if self.config.shard_mode != ShardMode.EXPLICIT or self.mesh is None:
+      return None, None, None
+
+    logical_rules = get_logical_axis_rules()
+    # Same sequence axis the shard_map specs below use: replicated unless a
+    # context axis carries it.
+    cp_len = LENGTH if gdn_context_axes(self.config) else None
+
+    def _sharding(logical_axes):
+      pspec = logical_to_mesh_axes(logical_axes, mesh=self.mesh, rules=logical_rules)
+      # Training microbatches can be smaller than the physical batch partition.
+      # Only dim 0 is inspected, so the trailing sizes are placeholders.
+      shape = (batch,) + (1,) * (len(logical_axes) - 1)
+      pspec = remove_incompatible_mesh_axes_from_partition_spec(
+          pspec, shape, self.mesh, dims=(0,), allow_remove_axes=True
+      )
+      return jax.sharding.NamedSharding(self.mesh, pspec)
+
+    return (
+        _sharding((KV_BATCH, cp_len, KV_HEAD)),
+        _sharding((KV_BATCH, cp_len, KV_HEAD, None)),
+        _sharding((KV_BATCH, KV_HEAD, None, None)),
     )
 
   def __call__(
@@ -607,11 +649,13 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       kv_cache=None,
       decoder_segment_ids: None | Array = None,
       attention_metadata=None,
+      out_sharding: jax.sharding.NamedSharding | None = None,
       **kwargs,
   ) -> tuple[Array, Any | None]:
     # hidden_states: (B, S, E)
     cfg = self.config
     batch, seq_len, _ = hidden_states.shape
+    flat_sharding, head_sharding, state_sharding = self._explicit_activation_shardings(batch)
 
     active_cache = kv_cache if kv_cache is not None else self.cache
 
@@ -630,9 +674,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # STEP A: Input Projections
     # =========================================================================
     # qkvz: (B, S, 2 * K_dim + 2 * V_dim)
-    qkvz = self.in_proj_qkvz(hidden_states)
+    qkvz = self.in_proj_qkvz(hidden_states, out_sharding=flat_sharding)
     # ba: (B, S, 2 * H_v)
-    ba = self.in_proj_ba(hidden_states)
+    ba = self.in_proj_ba(hidden_states, out_sharding=flat_sharding)
 
     # =========================================================================
     # QKVZ and BA Reshaping and Splitting (shared by both paths)
@@ -645,7 +689,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         2 * self.head_k_dim + 2 * self.head_v_dim * self.v_heads_per_k_head,
     )
     # mixed_qkvz: (B, S, H_k, 2*D_k + 2*D_v*V_per_K)
-    mixed_qkvz = qkvz.reshape(new_shape_qkvz)
+    mixed_qkvz = jnp.reshape(qkvz, new_shape_qkvz, out_sharding=head_sharding)
     if self.mesh is not None:
       logical_rules = get_logical_axis_rules()
       # LENGTH, not None. This with_sharding_constraint told XLA to gather the
@@ -665,7 +709,15 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           allow_remove_axes=True,
       )
       qkvz_sharding = jax.sharding.NamedSharding(self.mesh, qkvz_pspec)
-      mixed_qkvz = jax.lax.with_sharding_constraint(mixed_qkvz, qkvz_sharding)
+      # Under ShardMode.EXPLICIT `with_sharding_constraint` is an assertion rather
+      # than a hint and rejects any layout it has to change, so route through the
+      # helper that reshards instead.
+      mixed_qkvz = maybe_shard_with_name(
+          mixed_qkvz,
+          qkvz_sharding,
+          shard_mode=cfg.shard_mode,
+          debug_sharding=cfg.debug_sharding,
+      )
 
     split_indices_qkvz = [
         self.head_k_dim,  # D_k
@@ -679,9 +731,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     query, key, value_raw, z_raw = jnp.split(mixed_qkvz, split_indices_qkvz, axis=3)
 
     # value: (B, S, H_v, D_v)
-    value = value_raw.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
+    value = jnp.reshape(value_raw, (batch, seq_len, self.num_v_heads, self.head_v_dim), out_sharding=head_sharding)
     # z: (B, S, H_v, D_v)
-    z = z_raw.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
+    z = jnp.reshape(z_raw, (batch, seq_len, self.num_v_heads, self.head_v_dim), out_sharding=head_sharding)
 
     # BA Reshaping and Splitting
     new_shape_ba = (
@@ -691,7 +743,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
         2 * self.v_heads_per_k_head,
     )
     # mixed_ba: (B, S, H_k, 2 * V_per_K)
-    mixed_ba = ba.reshape(new_shape_ba)
+    mixed_ba = jnp.reshape(ba, new_shape_ba, out_sharding=head_sharding)
 
     split_indices_ba = [self.v_heads_per_k_head]
     # b_raw: (B, S, H_k, V_per_K)
@@ -699,9 +751,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     b_raw, a_raw = jnp.split(mixed_ba, split_indices_ba, axis=3)
 
     # b: (B, S, H_v)
-    b = b_raw.reshape(batch, seq_len, self.num_v_heads)
+    b = jnp.reshape(b_raw, (batch, seq_len, self.num_v_heads), out_sharding=flat_sharding)
     # a: (B, S, H_v)
-    a = a_raw.reshape(batch, seq_len, self.num_v_heads)
+    a = jnp.reshape(a_raw, (batch, seq_len, self.num_v_heads), out_sharding=flat_sharding)
 
     if use_paged_state:
       # =========================================================================
@@ -807,11 +859,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
 
     # Flatten head dimensions for concatenation before conv
     # q: (B, S, K_dim)
-    q = query.reshape(batch, seq_len, -1)
+    q = jnp.reshape(query, (batch, seq_len, -1), out_sharding=flat_sharding)
     # k: (B, S, K_dim)
-    k = key.reshape(batch, seq_len, -1)
+    k = jnp.reshape(key, (batch, seq_len, -1), out_sharding=flat_sharding)
     # v: (B, S, V_dim)
-    v = value.reshape(batch, seq_len, -1)
+    v = jnp.reshape(value, (batch, seq_len, -1), out_sharding=flat_sharding)
 
     # =========================================================================
     # STEP B: 1D Convolution
@@ -862,7 +914,7 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       conv_input = jnp.pad(qkv, ((0, 0), (conv_kernel_size - 1, 0), (0, 0)))
 
     # Perform the convolution.
-    conv_out = self.conv1d(conv_input)
+    conv_out = self.conv1d(conv_input, out_sharding=flat_sharding)
     # Slice the output to match the original input sequence length.
     conv_out = conv_out[:, -seq_len:, :]
     qkv_conv = jax.nn.silu(conv_out.astype(jnp.float32)).astype(cfg.dtype)
@@ -871,17 +923,25 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
 
     # Reshape for multi-head processing
     # query shape: (B, S, H_k, D_k)
-    query = q_conv.reshape(batch, seq_len, self.num_k_heads, self.head_k_dim)
+    query = jnp.reshape(q_conv, (batch, seq_len, self.num_k_heads, self.head_k_dim), out_sharding=head_sharding)
     # key shape: (B, S, H_k, D_k)
-    key = k_conv.reshape(batch, seq_len, self.num_k_heads, self.head_k_dim)
+    key = jnp.reshape(k_conv, (batch, seq_len, self.num_k_heads, self.head_k_dim), out_sharding=head_sharding)
     # value shape: (B, S, H_v, D_v)
-    value = v_conv.reshape(batch, seq_len, self.num_v_heads, self.head_v_dim)
+    value = jnp.reshape(v_conv, (batch, seq_len, self.num_v_heads, self.head_v_dim), out_sharding=head_sharding)
 
     # =========================================================================
     # STEP C: Gated Delta Rule Recurrence
     # =========================================================================
     A_log = jnp.asarray(self.A_log[...], dtype=cfg.dtype)
     dt_bias = jnp.asarray(self.dt_bias[...], dtype=cfg.dtype)
+    if cfg.shard_mode == ShardMode.EXPLICIT:
+      # Both are stored replicated but broadcast against (B, S, H_v) activations
+      # whose head axis is sharded. Explicit sharding requires the operands of a
+      # broadcast to agree, so align them with the head axis first -- the same
+      # fix `_align_scale_with_normalized_axis` applies to the norm scales.
+      head_spec = jax.sharding.PartitionSpec(jax.typeof(a).sharding.spec[-1])
+      A_log = jax.sharding.reshard(A_log, head_spec)
+      dt_bias = jax.sharding.reshard(dt_bias, head_spec)
     # beta shape: (B, S, H_v)
     beta = jax.nn.sigmoid(b)
     # g shape: (B, S, H_v)
@@ -897,9 +957,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     if self.num_v_heads > self.num_k_heads and self.num_v_heads % self.num_k_heads == 0:
       repeats = self.num_v_heads // self.num_k_heads
       # query shape after repeat: (B, S, H_v, D_k)
-      query = jnp.repeat(query, repeats, axis=2)
+      query = jnp.repeat(query, repeats, axis=2, out_sharding=head_sharding)
       # key shape after repeat: (B, S, H_v, D_k)
-      key = jnp.repeat(key, repeats, axis=2)
+      key = jnp.repeat(key, repeats, axis=2, out_sharding=head_sharding)
 
     if seq_len == 1 and model_mode == MODEL_MODE_AUTOREGRESSIVE:
       core_attn_out, next_recurrent_state = jax_ar_gated_delta_rule(
@@ -917,7 +977,11 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       recurrent_state_arg = (
           recurrent_state
           if recurrent_state is not None
-          else jnp.zeros((batch, self.num_v_heads, self.head_k_dim, self.head_v_dim), dtype=cfg.dtype)
+          else jnp.zeros(
+              (batch, self.num_v_heads, self.head_k_dim, self.head_v_dim),
+              dtype=cfg.dtype,
+              out_sharding=state_sharding,
+          )
       )
       # LENGTH, not None. The sequence axis was hardcoded to replicated, so
       # ici_context_parallelism could never shard the GDN sequence while still
@@ -953,6 +1017,19 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           dims=(0,),
           allow_remove_axes=True,
       )
+
+      if cfg.shard_mode == ShardMode.EXPLICIT:
+        # shard_map manualises the mesh axes it is given and will not insert a
+        # reshard for an operand whose layout differs from `in_specs`, so hand it
+        # arrays that already match. Gated on EXPLICIT: under AUTO these calls
+        # would lower to real `with_sharding_constraint`s and perturb the layouts
+        # GSPMD picks today.
+        query = jax.sharding.reshard(query, qkv_pspec)
+        key = jax.sharding.reshard(key, qkv_pspec)
+        value = jax.sharding.reshard(value, qkv_pspec)
+        g = jax.sharding.reshard(g, g_beta_pspec)
+        beta = jax.sharding.reshard(beta, g_beta_pspec)
+        recurrent_state_arg = jax.sharding.reshard(recurrent_state_arg, state_pspec)
 
       @functools.partial(
           jax.shard_map,
@@ -1026,14 +1103,14 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     # The normalization and gating is applied per-head on the value dimension.
 
     # Apply the norm and gate. Output shape: (B, S, H_v, D_v)
-    gated_output_reshaped = self.norm(core_attn_out, z)
+    gated_output_reshaped = self.norm(core_attn_out, z, out_sharding=head_sharding)
 
     # Reshape back to a single feature dimension for the final projection.
     # Shape from (B, S, H_v, D_v) -> (B, S, value_dim)
-    gated_output = gated_output_reshaped.reshape(batch, seq_len, -1)
+    gated_output = jnp.reshape(gated_output_reshaped, (batch, seq_len, -1), out_sharding=flat_sharding)
 
     # Final output shape: (B, S, E)
-    output = self.out_proj(gated_output)
+    output = self.out_proj(gated_output, out_sharding=out_sharding)
 
     return output, active_cache
 
@@ -1138,6 +1215,7 @@ class Qwen3NextFullAttention(nnx.Module):
       model_mode: str,
       kv_cache: None | jnp.ndarray = None,
       attention_metadata: None | dict[str, Any] = None,
+      out_sharding: jax.sharding.NamedSharding | None = None,
   ):
     attention_output, kv_cache = self.attention(
         inputs_q=inputs,
@@ -1148,6 +1226,7 @@ class Qwen3NextFullAttention(nnx.Module):
         model_mode=model_mode,
         kv_cache=kv_cache,
         attention_metadata=attention_metadata,
+        out_sharding=out_sharding,
     )
     return attention_output, kv_cache
 
@@ -1225,6 +1304,8 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
       hidden_states: Array,
       deterministic: bool,
       forced_routed_experts: jnp.ndarray | None = None,
+      intermediate_sharding: jax.sharding.NamedSharding | None = None,
+      out_sharding: jax.sharding.NamedSharding | None = None,
   ) -> tuple[Array, Array | None]:
     """
     Applies the sparse MoE block to the input hidden states.
@@ -1232,6 +1313,10 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
     Args:
       hidden_states: The input array from the previous layer. Shape: (batch, seq, embed_dim)
       deterministic: If True, disables dropout.
+      intermediate_sharding: Optional layout for the shared expert's intermediate
+        activation, honoured only under `ShardMode.EXPLICIT`.
+      out_sharding: Optional layout for the block output, honoured only under
+        `ShardMode.EXPLICIT`.
 
     Returns:
       A tuple containing:
@@ -1239,15 +1324,23 @@ class Qwen3NextSparseMoeBlock(nnx.Module):
         - The load balancing loss from the routed experts, if applicable during training.
     """
     # 1. Apply the routed experts block.
-    routed_output, load_balance_loss, _ = self.routed_experts(hidden_states, forced_routed_experts=forced_routed_experts)
+    routed_output, load_balance_loss, _ = self.routed_experts(
+        hidden_states, out_sharding=out_sharding, forced_routed_experts=forced_routed_experts
+    )
 
     if not self.use_shared_expert:
       return routed_output, load_balance_loss
 
     # 2. Apply the shared expert.
-    shared_expert_output = self.shared_expert(hidden_states, deterministic=deterministic)
+    shared_expert_output = self.shared_expert(
+        hidden_states,
+        deterministic=deterministic,
+        intermediate_sharding=intermediate_sharding,
+        out_sharding=out_sharding,
+    )
 
-    # 3. Apply the gate for the shared expert.
+    # 3. Apply the gate for the shared expert. The output is (batch, seq, 1), so it
+    # carries no feature axis to pin and takes the default layout.
     shared_gate_output = self.shared_expert_gate(hidden_states)
 
     # 4. Combine the outputs.

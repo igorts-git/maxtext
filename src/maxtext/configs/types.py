@@ -4307,6 +4307,7 @@ class MaxTextConfig(
           "qwen3",
           "qwen3_moe",
           "qwen3_custom_moe",
+          "qwen3_5",
           "gemma",
           "gemma2",
           "gemma3",
@@ -4321,6 +4322,25 @@ class MaxTextConfig(
             "'explicit' sharding is not supported with `use_multimodal`; the vision and audio encoders "
             "have not been onboarded to explicit sharding yet."
         )
+      if self.decoder_block == DecoderBlockType.QWEN3_5:
+        if not self.sparse_matmul:
+          raise ValueError(
+              "'explicit' sharding with the 'qwen3_5' decoder requires `sparse_matmul=True`; the dense "
+              "matmul MoE path has not been onboarded to explicit sharding yet."
+          )
+        gdn_context_parallel_size = (
+            self.ici_context_parallelism
+            * self.dcn_context_parallelism
+            * self.ici_context_usp_ulysses_parallelism
+            * self.dcn_context_usp_ulysses_parallelism
+        )
+        if gdn_context_parallel_size > 1:
+          raise ValueError(
+              "'explicit' sharding with the 'qwen3_5' decoder does not support context parallelism yet. The "
+              "GatedDeltaNet short convolution left-pads the sequence by `gdn_conv_kernel_dim - 1` and slices "
+              "the result back, which explicit sharding cannot express on a sharded sequence axis. Use "
+              "`shard_mode=auto` when `ici_context_parallelism` or `ici_context_usp_ulysses_parallelism` is set."
+          )
     if self.context_sharding not in ("context", "expert"):
       raise ValueError(f"Assigned context_sharding f{self.context_sharding} is not supported.")
     if self.ulysses_context_sharding != "context_usp_ulysses":

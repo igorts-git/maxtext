@@ -240,7 +240,7 @@ class PyconfigTest(unittest.TestCase):
 
   def test_explicit_sharding_qwen3_decoder_support(self):
     """The Qwen3 decoders that have been onboarded to explicit sharding are accepted."""
-    for decoder_block in ("qwen3", "qwen3_moe", "qwen3_custom_moe"):
+    for decoder_block in ("qwen3", "qwen3_moe", "qwen3_custom_moe", "qwen3_5"):
       with self.subTest(decoder_block=decoder_block):
         config = pyconfig.initialize(
             [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
@@ -250,9 +250,10 @@ class PyconfigTest(unittest.TestCase):
         )
         self.assertEqual(config.decoder_block.value, decoder_block)
 
-    # Qwen3-Next and Qwen3.5 use gated-delta-net linear attention, and the
-    # Qwen3-VL/Omni encoders are multimodal; neither is onboarded yet.
-    for decoder_block in ("qwen3_next", "qwen3_5"):
+    # Qwen3-Next has its own decoder layer and scanned block, which still express
+    # their layouts with nn.with_logical_constraint; the Qwen3-VL/Omni encoders are
+    # multimodal. Neither is onboarded yet.
+    for decoder_block in ("qwen3_next",):
       with self.subTest(decoder_block=decoder_block):
         with self.assertRaisesRegex(Exception, "not supported with 'explicit' sharding"):
           pyconfig.initialize(
@@ -272,6 +273,27 @@ class PyconfigTest(unittest.TestCase):
           use_multimodal=True,
           scan_layers=False,  # Required by the Qwen3-VL deepstack path; unrelated to sharding.
       )
+
+  def test_explicit_sharding_qwen3_5_unsupported_combinations(self):
+    """Qwen3.5 rejects the explicit-sharding combinations it has not been onboarded to."""
+
+    def initialize(**kwargs):
+      return pyconfig.initialize(
+          [os.path.join(MAXTEXT_PKG_DIR, "train.py"), get_test_config_path()],
+          skip_jax_distributed_system=True,
+          shard_mode="explicit",
+          decoder_block="qwen3_5",
+          **kwargs,
+      )
+
+    with self.assertRaisesRegex(Exception, "requires `sparse_matmul=True`"):
+      initialize(sparse_matmul=False, megablox=False)
+
+    with self.assertRaisesRegex(Exception, "does not support context parallelism"):
+      initialize(ici_context_parallelism=2)
+
+    with self.assertRaisesRegex(Exception, "does not support context parallelism"):
+      initialize(ici_context_usp_ulysses_parallelism=2)
 
   def test_explicit_sharding_mistral_decoder_support(self):
     """The Mistral-family decoders that have been onboarded to explicit sharding are accepted."""
