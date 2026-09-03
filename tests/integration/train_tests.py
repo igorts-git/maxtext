@@ -149,11 +149,9 @@ class TrainTests(unittest.TestCase):
       rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.mistral-v1')}",
   ]
 
-  # Qwen3.5 is a hybrid decoder: `inhomogeneous_layer_cycle_interval` is 4, so three
-  # gated-delta-net layers are followed by one full-attention layer, both on top of a
-  # fully-MoE block with a shared expert. Four layers is one whole cycle, so every
-  # sublayer runs. head_dim has to stay at 256 because `mrope_section` sums to
-  # head_dim * partial_rotary_factor / 2.
+  # Four layers is one whole `inhomogeneous_layer_cycle_interval`, so both the
+  # gated-delta-net and the full-attention layer run. head_dim has to stay at 256
+  # because `mrope_section` sums to head_dim * partial_rotary_factor / 2.
   _qwen3_5_overrides = [
       "model_name=qwen3.5-35b-a3b",
       "override_model_config=True",
@@ -172,8 +170,7 @@ class TrainTests(unittest.TestCase):
       "gdn_value_head_dim=64",
       "vocab_size=2048",
       "max_target_length=256",
-      # RoutedMoE.dense_matmul is not onboarded to explicit sharding yet, so exercise the
-      # sparse_matmul path.
+      # RoutedMoE.dense_matmul is not onboarded to explicit sharding yet.
       "sparse_matmul=True",
       "megablox=True",
       # The Qwen3.5 model configs default to a HuggingFace tokenizer that is not
@@ -181,6 +178,35 @@ class TrainTests(unittest.TestCase):
       "tokenizer_type=tiktoken",
       rf"tokenizer_path={os.path.join(MAXTEXT_ASSETS_ROOT, 'tokenizers', 'tokenizer.llama2')}",
   ]
+
+  # Same sublayers as Qwen3.5, wired together by Qwen3NextScannableBlock rather than a
+  # Python loop. No MRoPE, so head_dim is free.
+  _qwen3_next_overrides = [
+      "model_name=qwen3-next-80b-a3b",
+      "override_model_config=True",
+      "base_num_decoder_layers=4",
+      "base_emb_dim=256",
+      "base_mlp_dim=256",
+      "base_moe_mlp_dim=256",
+      "base_num_query_heads=8",
+      "base_num_kv_heads=8",
+      "head_dim=128",
+      "num_experts=8",
+      "num_experts_per_tok=2",
+      "gdn_num_key_heads=4",
+      "gdn_num_value_heads=8",
+      "gdn_key_head_dim=64",
+      "gdn_value_head_dim=64",
+      "vocab_size=2048",
+      "max_target_length=256",
+      "sparse_matmul=True",
+      "megablox=True",
+  ]
+
+  _QWEN3_HYBRID_MODELS = {
+      "qwen3_5": _qwen3_5_overrides,
+      "qwen3_next": _qwen3_next_overrides,
+  }
 
   CONFIGS = {
       "base": [  # short test for train.py with TFDS c4
@@ -895,41 +921,41 @@ class TrainTests(unittest.TestCase):
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
-  def test_tpu_qwen3_5_explicit_sharding_matches_auto(self):
+  def test_tpu_qwen3_hybrid_explicit_sharding_matches_auto(self):
     """Explicit sharding only changes how layouts are expressed, so the losses must not move.
 
-    Both parallelisms are run because they stress different halves of the hybrid layer:
-    expert parallelism shards the MoE dispatch, while tensor parallelism shards the
-    gated-delta-net head axis, which is the one the layer has to carry by hand across
-    its reshapes, its head repeat and the `jax.shard_map` boundary.
+    The two decoders share every sublayer, so each is paired with the parallelism that
+    stresses a different half of it: expert parallelism shards the MoE dispatch, and
+    tensor parallelism shards the gated-delta-net head axis, which is the one the layer
+    has to carry by hand across its reshapes, its head repeat and the `jax.shard_map`
+    boundary. Qwen3-Next takes the latter because it also nests two `jax.lax.scan`s,
+    whose carry layout has to stay invariant across iterations.
     """
     parallelism = {
-        "expert": ["ici_fsdp_parallelism=1", "ici_expert_parallelism=-1"],
+        "qwen3_5": ["ici_fsdp_parallelism=1", "ici_expert_parallelism=-1"],
         # The gated-delta-net weights stay replicated under tensor parallelism, which is
         # a large fraction of a model this small, so relax the unsharded-parameter check.
-        "tensor": ["ici_fsdp_parallelism=1", "ici_tensor_parallelism=-1", "sharding_tolerance=0.5"],
+        "qwen3_next": ["ici_fsdp_parallelism=1", "ici_tensor_parallelism=-1", "sharding_tolerance=0.5"],
     }
-    for axis, args in parallelism.items():
-      with self.subTest(parallelism=axis):
-        auto_losses = self._losses(f"qwen3_5_{axis}_auto", self._qwen3_5_overrides, args + ["shard_mode=auto"])
-        explicit_losses = self._losses(
-            f"qwen3_5_{axis}_explicit", self._qwen3_5_overrides, args + ["shard_mode=explicit"]
-        )
-        print(f"[qwen3.5 {axis}] auto losses: {auto_losses}", flush=True)
-        print(f"[qwen3.5 {axis}] explicit losses: {explicit_losses}", flush=True)
+    for decoder_block, model_overrides in self._QWEN3_HYBRID_MODELS.items():
+      with self.subTest(decoder_block=decoder_block):
+        args = parallelism[decoder_block]
+        auto_losses = self._losses(f"{decoder_block}_auto", model_overrides, args + ["shard_mode=auto"])
+        explicit_losses = self._losses(f"{decoder_block}_explicit", model_overrides, args + ["shard_mode=explicit"])
+        print(f"[{decoder_block}] auto losses: {auto_losses}", flush=True)
+        print(f"[{decoder_block}] explicit losses: {explicit_losses}", flush=True)
         self.assertTrue(auto_losses, "auto run produced no metrics")
         # `activation_batch` carries the expert axis, so pinning it reassociates the
-        # backward reductions rather than leaving the layout untouched: the forward pass
-        # is bit-for-bit and the drift only appears once gradients flow. Over 20 steps it
-        # stays bounded below 3e-5 relative and changes sign, i.e. it is float noise
-        # rather than the two runs pulling apart.
+        # backward reductions: the forward pass is bit-for-bit and the drift only appears
+        # once gradients flow. Over 20 steps it stays below 4e-5 relative and changes
+        # sign, i.e. it is float noise rather than the two runs pulling apart.
         np.testing.assert_allclose(explicit_losses, auto_losses, rtol=1e-4, atol=0.0)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only
   # TODO(b/517509898): Skip ZeRo-1 compiler Segfault on TPU7x SparseCore platforms
   @pytest.mark.skip_on_tpu7x
-  def test_tpu_qwen3_5_zero1_gradient_accumulation(self):
+  def test_tpu_qwen3_hybrid_zero1_gradient_accumulation(self):
     """ZeRO-1 only shards the optimizer state, so it must not change the loss trajectory.
 
     Under explicit sharding this routes the accumulated gradients through the
@@ -947,21 +973,23 @@ class TrainTests(unittest.TestCase):
         "dcn_fsdp_parallelism=1",
         "gradient_accumulation_steps=8",
     ]
-    baseline = self._losses(
-        "qwen3_5_ga",
-        self._qwen3_5_overrides,
-        zero1_ga + ["shard_mode=auto", "shard_optimizer_over_data=False"],
-    )
-    sharded = self._losses(
-        "qwen3_5_ga_zero1",
-        self._qwen3_5_overrides,
-        zero1_ga + ["shard_mode=explicit", "shard_optimizer_over_data=True"],
-    )
-    print(f"[qwen3.5] auto + GA losses: {baseline}", flush=True)
-    print(f"[qwen3.5] explicit + ZeRO-1 + GA losses: {sharded}", flush=True)
-    self.assertTrue(baseline, "baseline run produced no metrics")
-    # ZeRO-1 reassociates the gradient all-reduce, so allow a little float slack.
-    np.testing.assert_allclose(sharded, baseline, rtol=1e-4, atol=0.0)
+    for decoder_block, model_overrides in self._QWEN3_HYBRID_MODELS.items():
+      with self.subTest(decoder_block=decoder_block):
+        baseline = self._losses(
+            f"{decoder_block}_ga",
+            model_overrides,
+            zero1_ga + ["shard_mode=auto", "shard_optimizer_over_data=False"],
+        )
+        sharded = self._losses(
+            f"{decoder_block}_ga_zero1",
+            model_overrides,
+            zero1_ga + ["shard_mode=explicit", "shard_optimizer_over_data=True"],
+        )
+        print(f"[{decoder_block}] auto + GA losses: {baseline}", flush=True)
+        print(f"[{decoder_block}] explicit + ZeRO-1 + GA losses: {sharded}", flush=True)
+        self.assertTrue(baseline, "baseline run produced no metrics")
+        # ZeRO-1 reassociates the gradient all-reduce, so allow a little float slack.
+        np.testing.assert_allclose(sharded, baseline, rtol=1e-4, atol=0.0)
 
   @pytest.mark.integration_test
   @pytest.mark.tpu_only

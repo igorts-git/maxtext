@@ -608,15 +608,13 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
   def _explicit_activation_shardings(self, batch: int):
     """Physical layouts for the GatedDeltaNet activations under explicit sharding.
 
-    Explicit sharding cannot infer a layout across the reshapes, the head repeat
-    or the shard_map boundary in `__call__`, so every intermediate is pinned to
-    the same logical axes the auto path already asks GSPMD for. All three are
-    `None` under `ShardMode.AUTO`, where the callees drop the argument and GSPMD
-    keeps inferring exactly what it inferred before.
+    Explicit sharding cannot infer a layout across the reshapes, the head repeat or the
+    shard_map boundary in `__call__`, so every intermediate is pinned to the logical
+    axes the auto path already asks GSPMD for.
 
     Returns:
       `(flat, head, state)` shardings for `(B, S, H*D)`, `(B, S, H, D)` and
-      `(B, H, D_k, D_v)` shaped activations respectively.
+      `(B, H, D_k, D_v)` shaped activations, all `None` under `ShardMode.AUTO`.
     """
     if self.config.shard_mode != ShardMode.EXPLICIT or self.mesh is None:
       return None, None, None
@@ -709,9 +707,8 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
           allow_remove_axes=True,
       )
       qkvz_sharding = jax.sharding.NamedSharding(self.mesh, qkvz_pspec)
-      # Under ShardMode.EXPLICIT `with_sharding_constraint` is an assertion rather
-      # than a hint and rejects any layout it has to change, so route through the
-      # helper that reshards instead.
+      # Under ShardMode.EXPLICIT `with_sharding_constraint` is an assertion rather than
+      # a hint and rejects any layout it has to change, so reshard through the helper.
       mixed_qkvz = maybe_shard_with_name(
           mixed_qkvz,
           qkvz_sharding,
@@ -935,10 +932,10 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
     A_log = jnp.asarray(self.A_log[...], dtype=cfg.dtype)
     dt_bias = jnp.asarray(self.dt_bias[...], dtype=cfg.dtype)
     if cfg.shard_mode == ShardMode.EXPLICIT:
-      # Both are stored replicated but broadcast against (B, S, H_v) activations
-      # whose head axis is sharded. Explicit sharding requires the operands of a
-      # broadcast to agree, so align them with the head axis first -- the same
-      # fix `_align_scale_with_normalized_axis` applies to the norm scales.
+      # Both are stored replicated but broadcast against (B, S, H_v) activations whose
+      # head axis is sharded, and explicit sharding requires broadcast operands to
+      # agree -- the same fix `_align_scale_with_normalized_axis` applies to the norm
+      # scales.
       head_spec = jax.sharding.PartitionSpec(jax.typeof(a).sharding.spec[-1])
       A_log = jax.sharding.reshard(A_log, head_spec)
       dt_bias = jax.sharding.reshard(dt_bias, head_spec)
@@ -1019,11 +1016,9 @@ class Qwen3NextGatedDeltaNet(nnx.Module):
       )
 
       if cfg.shard_mode == ShardMode.EXPLICIT:
-        # shard_map manualises the mesh axes it is given and will not insert a
-        # reshard for an operand whose layout differs from `in_specs`, so hand it
-        # arrays that already match. Gated on EXPLICIT: under AUTO these calls
-        # would lower to real `with_sharding_constraint`s and perturb the layouts
-        # GSPMD picks today.
+        # shard_map manualises the mesh axes it is given and will not insert a reshard
+        # for an operand whose layout differs from `in_specs`, so hand it arrays that
+        # already match.
         query = jax.sharding.reshard(query, qkv_pspec)
         key = jax.sharding.reshard(key, qkv_pspec)
         value = jax.sharding.reshard(value, qkv_pspec)
@@ -1450,6 +1445,20 @@ class Qwen3NextScannableBlock(nnx.Module):
     else:
       self.global_layer = None
 
+    self.activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
+    # Same convention as Qwen3NextDecoderLayer: pin the carry under ShardMode.EXPLICIT,
+    # and leave the AUTO path free of sharding constraints so XLA keeps its fusions.
+    if cfg.shard_mode == ShardMode.EXPLICIT:
+      self._maybe_shard_with_logical = functools.partial(
+          maybe_shard_with_logical,
+          mesh=mesh,
+          shard_mode=cfg.shard_mode,
+          debug_sharding=cfg.debug_sharding,
+          extra_stack_level=1,
+      )
+    else:
+      self._maybe_shard_with_logical = lambda inputs, *args, **kwargs: inputs
+
   def _run_layer(self, layer, y, layer_kwargs, kv_cache=None):
     """Invokes one Qwen3NextDecoderLayer, returning (output, updated_kv_cache)."""
     out = layer(y, **layer_kwargs, kv_cache=kv_cache)
@@ -1572,7 +1581,7 @@ class Qwen3NextScannableBlock(nnx.Module):
     """
     cfg = self.config
     inputs = carry
-    inputs = nn.with_logical_constraint(inputs, ("activation_batch", "activation_norm_length", "activation_embed"))
+    inputs = self._maybe_shard_with_logical(inputs, self.activation_axis_names)
 
     layer_kwargs = {
         "decoder_segment_ids": decoder_segment_ids,
@@ -1634,6 +1643,26 @@ class Qwen3NextDecoderLayer(nnx.Module):
     self.quant = quant
     cfg = self.config
     self.activation_axis_names = ("activation_batch", "activation_norm_length", "activation_embed")
+    self.mlp_activation_axis_names = ("activation_batch", "activation_norm_length", "activation_mlp")
+
+    # Physical shardings used to pin sublayer outputs under ShardMode.EXPLICIT. In
+    # ShardMode.AUTO the callees ignore these and let GSPMD infer the layout.
+    if cfg.shard_mode == ShardMode.EXPLICIT:
+      self.out_sharding = create_sharding(mesh, self.activation_axis_names, rules=get_logical_axis_rules())
+      self.mlp_intermediate_sharding = create_sharding(
+          mesh, self.mlp_activation_axis_names, rules=get_logical_axis_rules()
+      )
+      self._maybe_shard_with_logical = functools.partial(
+          maybe_shard_with_logical,
+          mesh=mesh,
+          shard_mode=cfg.shard_mode,
+          debug_sharding=cfg.debug_sharding,
+          extra_stack_level=1,
+      )
+    else:
+      self.out_sharding = None
+      self.mlp_intermediate_sharding = None
+      self._maybe_shard_with_logical = lambda inputs, *args, **kwargs: inputs
 
     # First LayerNorm, applied before the attention block.
     self.input_layernorm = Qwen3NextRMSNorm(
@@ -1641,6 +1670,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 
@@ -1674,6 +1704,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
         epsilon=cfg.normalization_layer_epsilon,
         dtype=cfg.dtype,
         weight_dtype=cfg.weight_dtype,
+        shard_mode=cfg.shard_mode,
         rngs=rngs,
     )
 
@@ -1695,11 +1726,12 @@ class Qwen3NextDecoderLayer(nnx.Module):
     # Unpack inputs if it's a tuple (e.g. from a previous layer returning (hidden_states, kv_cache))
     if isinstance(inputs, tuple):
       inputs = inputs[0]
+    inputs = self._maybe_shard_with_logical(inputs, self.activation_axis_names)
     residual = inputs
 
     # First LayerNorm, applied before the attention block.
-    hidden_states = self.input_layernorm(inputs)
-    hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
+    hidden_states = self.input_layernorm(inputs, out_sharding=self.out_sharding)
+    hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
     # Conditionally apply either the Linear Attention or Full Attention block.
     if isinstance(self.attention, Qwen3NextFullAttention):
@@ -1711,6 +1743,7 @@ class Qwen3NextDecoderLayer(nnx.Module):
           model_mode,
           kv_cache=kv_cache,  # pyrefly: ignore[bad-argument-type]
           attention_metadata=attention_metadata,
+          out_sharding=self.out_sharding,
       )
     else:
       attention_output, new_kv_cache = cast(Qwen3NextGatedDeltaNet, self.attention)(
@@ -1719,21 +1752,28 @@ class Qwen3NextDecoderLayer(nnx.Module):
           kv_cache=kv_cache,
           decoder_segment_ids=decoder_segment_ids,
           attention_metadata=attention_metadata,
+          out_sharding=self.out_sharding,
       )
 
     # First residual connection after attention
+    attention_output = self._maybe_shard_with_logical(attention_output, self.activation_axis_names)
     hidden_states = residual + attention_output
-    hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
+    hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
     # Prepare for the MoE block by capturing the new residual
     residual = hidden_states
 
     # Second LayerNorm, applied before the MoE block.
-    hidden_states = self.post_attention_layernorm(hidden_states)
-    hidden_states = nn.with_logical_constraint(hidden_states, self.activation_axis_names)
+    hidden_states = self.post_attention_layernorm(hidden_states, out_sharding=self.out_sharding)
+    hidden_states = self._maybe_shard_with_logical(hidden_states, self.activation_axis_names)
 
     # Instantiate and call our `Qwen3NextSparseMoeBlock`.
-    mlp_output, load_balance_loss = self.mlp(hidden_states, deterministic=deterministic)
+    mlp_output, load_balance_loss = self.mlp(
+        hidden_states,
+        deterministic=deterministic,
+        intermediate_sharding=self.mlp_intermediate_sharding,
+        out_sharding=self.out_sharding,
+    )
 
     # We sow the load balancing loss so it can be collected and added to the total loss
     # during training.
@@ -1741,8 +1781,9 @@ class Qwen3NextDecoderLayer(nnx.Module):
       self.moe_lb_loss = nnx.Intermediate(load_balance_loss)
 
     # Final residual connection (after the MoE block)
+    mlp_output = self._maybe_shard_with_logical(mlp_output, self.activation_axis_names)
     layer_output = residual + mlp_output
-    layer_output = nn.with_logical_constraint(
+    layer_output = self._maybe_shard_with_logical(
         layer_output,
         self.activation_axis_names,
     )
