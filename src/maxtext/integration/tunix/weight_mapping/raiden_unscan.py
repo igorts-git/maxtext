@@ -36,11 +36,27 @@ function's pattern-block matching would silently no-op on Qwen3 trees (its
 simpler, single-axis case directly instead of adapting that function.
 """
 
+import re
 from typing import Any
 
 import jax
 from flax import nnx
 from flax.traverse_util import flatten_dict, unflatten_dict
+
+
+def _slice_along_axis(arr: Any, idx: int, axis: int) -> Any:
+  """Slices a tensor or abstract ShapeDtypeStruct along a specific axis."""
+  if isinstance(arr, jax.ShapeDtypeStruct):
+    new_shape = arr.shape[:axis] + arr.shape[axis + 1 :]
+    new_sharding = None
+    sharding = getattr(arr, "sharding", None)
+    if isinstance(sharding, jax.sharding.NamedSharding):
+      spec = list(sharding.spec)
+      spec = (spec + [None] * len(arr.shape))[: len(arr.shape)]
+      new_spec = tuple(spec[:axis] + spec[axis + 1 :])
+      new_sharding = jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*new_spec))
+    return jax.ShapeDtypeStruct(new_shape, arr.dtype, sharding=new_sharding)
+  return jax.lax.index_in_dim(arr, idx, axis=axis, keepdims=False)
 
 
 def unscan_layers(
@@ -79,6 +95,8 @@ def unscan_layers(
   new_flat = {}
   unscanned_count = 0
 
+  slot_pattern = re.compile(r"layer_(\d+)")
+
   # Drain `flat` as we go (pop, not iterate-then-keep) rather than holding
   # every original scanned array alive for the whole function: at 30B-A3B
   # scale (padded MoE weights are tens of GB each), keeping both the
@@ -106,18 +124,39 @@ def unscan_layers(
       continue
     del value
 
-    if arr.shape[scan_axis] != num_layers:
-      raise ValueError(
-          f"unscan_layers: {'.'.join(key)!r} has shape {arr.shape}, expected axis {scan_axis} to be"
-          f" num_layers={num_layers}."
-      )
+    match = slot_pattern.fullmatch(str(suffix[0])) if suffix else None
+    if match:
+      slot = int(match.group(1))
+      actual_suffix = suffix[1:]
+      num_blocks = arr.shape[scan_axis]
+      if num_layers % num_blocks != 0:
+        raise ValueError(
+            f"unscan_layers: {'.'.join(map(str, key))!r} has shape {arr.shape} with scan axis {scan_axis} "
+            f"length {num_blocks}, which does not divide num_layers={num_layers}."
+        )
+      cycle = num_layers // num_blocks
+      if slot >= cycle:
+        raise ValueError(f"unscan_layers: slot {slot} exceeds cycle {cycle} for key {'.'.join(map(str, key))!r}.")
+      for block in range(num_blocks):
+        global_idx = block * cycle + slot
+        new_key = prefix + (f"{layer_container}_{global_idx}",) + actual_suffix
+        sliced = _slice_along_axis(arr, block, axis=scan_axis)
+        new_flat[new_key] = sliced
+      del arr
+      unscanned_count += 1
+    else:
+      if arr.shape[scan_axis] != num_layers:
+        raise ValueError(
+            f"unscan_layers: {'.'.join(map(str, key))!r} has shape {arr.shape}, expected axis {scan_axis} to be"
+            f" num_layers={num_layers}."
+        )
 
-    for i in range(num_layers):
-      sliced = jax.lax.index_in_dim(arr, i, axis=scan_axis, keepdims=False)
-      new_key = prefix + (f"{layer_container}_{i}",) + suffix
-      new_flat[new_key] = sliced
-    del arr
-    unscanned_count += 1
+      for i in range(num_layers):
+        sliced = _slice_along_axis(arr, i, axis=scan_axis)
+        new_key = prefix + (f"{layer_container}_{i}",) + suffix
+        new_flat[new_key] = sliced
+      del arr
+      unscanned_count += 1
 
   if unscanned_count == 0:
     raise ValueError(
