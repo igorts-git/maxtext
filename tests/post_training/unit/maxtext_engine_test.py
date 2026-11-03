@@ -29,6 +29,7 @@ from flax import struct
 import jax
 import jax.numpy as jnp
 from maxtext.common import checkpoint_context
+from maxtext.common import train_state_nnx
 from maxtext.configs import pyconfig
 from maxtext.configs import types as config_types
 from maxtext.training_engine import abstract_engine
@@ -2401,6 +2402,49 @@ class MaxTextTrainingEngineTest(absltest.TestCase):
       # when `fwd_only` queued its computation.
       write_metrics.assert_called_once()
       self.assertIsNone(t._throttler._pending_metrics)
+
+  def test_state_setter_syncs_model_and_optimizer_and_resets_compiled_state(self):
+    """Assigning `engine.state = ...` updates `engine.model` and `engine.optimizer` and resets compilation."""
+    t = maxtext_engine.MaxTextTrainingEngine(self.mock_config)
+    t.with_loss_fn(
+        lambda m, *a, **k: (
+            abstract_engine.WeightedMetric(unreduced_sum=jnp.sum(m.weights[...]), denominator=jnp.array(1.0)),
+            {},
+        ),
+        has_aux=True,
+    )
+    t.compile()
+    t.fwd_bwd(DummyPayload())
+    self.assertTrue(t._compiled)
+    self.assertIsNotNone(t._compiled_fwd_bwd)
+    self.assertIsNotNone(t._compiled_update)
+
+    new_model = DummyNNXModel()
+    new_model.weights.set_value(jnp.array([10.0, 20.0]))
+    new_optimizer = nnx.Optimizer(new_model, optax.sgd(0.05), wrt=nnx.Param)
+    new_state = train_state_nnx.TrainStateNNX(new_model, new_optimizer)
+
+    t.state = new_state
+    self.assertIs(t.model, new_model)
+    self.assertIs(t.optimizer, new_optimizer)
+    self.assertFalse(t._compiled)
+    self.assertIsNone(t._compiled_fwd_bwd)
+    self.assertIsNone(t._compiled_update)
+    self.assertIsNone(t._model_graphdef)
+    self.assertIsNone(t._state_graphdef)
+
+  def test_settle_state_places_and_shards_in_a_single_pass(self):
+    """`_settle_state` places unplaced leaves on the mesh and shards optimizer state in a single pass."""
+    cfg = self.setup_config(shard_optimizer_over_data=True, ici_fsdp_parallelism=1, ici_data_parallelism=-1)
+    t = maxtext_engine.MaxTextTrainingEngine(cfg)
+    _ = t.state
+    with mock.patch("jax.device_put", wraps=jax.device_put) as mock_put:
+      t._settle_state()
+      first_pass_calls = mock_put.call_count
+      self.assertGreater(first_pass_calls, 0)
+      # Second call is a no-op because all leaves already carry target shardings.
+      t._settle_state()
+      self.assertEqual(mock_put.call_count, first_pass_calls)
 
 
 class MaxTextMoeRoutedExpertsPrecompileE2ETest(parameterized.TestCase):
